@@ -14,6 +14,7 @@
 #
 # 目录约定(均相对本脚本所在目录):
 #   busybox/ kernel/ u-boot/        repo sync 的源码树(需含 qemu_defconfig 提交)
+#   dropbear/                       dropbear 源码(-b 时自动从官方 GitHub 仓库 mkj/dropbear 克隆发布 tag)
 #   build/{busybox,uboot,kernel}    O= 构建目录
 #   build/rootfs                    busybox install 的 rootfs 骨架(-b 时删除重建)
 #   build/rootfs.cpio.gz            initramfs 自动验证版(-r test), 零填充到固定 4MiB
@@ -23,8 +24,8 @@
 #
 # 网络拓扑(两种模式, 由 -r 的 --net=icmp 切换):
 #   默认 -r        单网卡 SLIRP: guest 10.0.2.15/24 (MAC ...:FE:02), 出网走 NAT(网关 10.0.2.2);
-#                  hostfwd 把主机 2222 端口转发到 guest 22 —— guest 装 dropbear 后:
-#                  ssh -p 2222 root@127.0.0.1 (容器外: ssh -p 2222 root@<容器IP>)
+#                  hostfwd 把主机 2222 端口转发到 guest 22 —— dropbear 已预装:
+#                  ssh -p 2222 root@127.0.0.1 (密码 root; 容器外: ssh -p 2222 root@<容器IP>)
 #   -r --net=icmp  加一块 eth0 走 vm-net.py 用户态 ICMP 网桥(192.168.100.2/24 <-> 主机 192.168.100.1):
 #                  主机侧 python3 vm-net.py ping 192.168.100.2; guest 侧 ping 192.168.100.1
 #                  (本容器无 CAP_NET_ADMIN 建不了 TAP, 网桥为用户态实现; guest 不能配 172.17.0.x)
@@ -58,6 +59,12 @@ INITRAMFS_SHELL="$BUILD/rootfs-shell.cpio.gz" # 交互终端版(-r): busybox ini
 INITRAMFS_SIZE=$((4 * 1024 * 1024))    # 0x400000, 与 u-boot qemu_defconfig 的 BOOTCOMMAND 对应
 CROSS_PREFIX="aarch64-linux-musl-"
 J="$(nproc)"
+# --- dropbear(板卡 SSH 服务端) ---
+# 官方源码: GitHub 仓库 https://github.com/mkj/dropbear (作者 Matt Johnston), 发布 tag 形如
+# DROPBEAR_2026.94, 仓库自带预生成的 configure。换版本: DROPBEAR_VER=2026.93 ./build_qemu.sh -b
+SRC_DROPBEAR="$ROOT/dropbear"
+DROPBEAR_REPO="${DROPBEAR_REPO:-https://github.com/mkj/dropbear.git}"
+DROPBEAR_VER="${DROPBEAR_VER:-2026.94}"
 # --- 虚拟机网络(默认单网卡 SLIRP+SSH; --net=icmp 启用用户态网桥, 详见 vm-net.py 文件头) ---
 NET_MAC_BR="52:54:00:CA:FE:01"    # guest eth0: 主机<->guest 直连通道
 NET_MAC_USR="52:54:00:CA:FE:02"   # guest eth1: SLIRP 出网
@@ -138,6 +145,10 @@ for n in /sys/class/net/eth*; do
             ;;
     esac
 done
+# SSH: devpts 是 PTY 分配的前提, 缺它登录会卡在会话建立; dropbear 监听 22
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null
+[ -x /usr/sbin/dropbear ] && /usr/sbin/dropbear
 EOF
     chmod 755 "$BUILD/rootfs/etc/rc.sh"
 }
@@ -168,6 +179,63 @@ build_kernel() {
     step "kernel: qemu_defconfig -> 编译 (需 ARCH=arm64 + CROSS_COMPILE)"
     make -C "$SRC_KERNEL" O="$BUILD/kernel" ARCH=arm64 CROSS_COMPILE="$CROSS_PREFIX" qemu_defconfig
     make -C "$SRC_KERNEL" O="$BUILD/kernel" ARCH=arm64 CROSS_COMPILE="$CROSS_PREFIX" -j"$J"
+}
+
+build_dropbear() {
+    step "dropbear: 获取官方源码 -> 交叉编译(静态) -> 安装到 rootfs (SSH 服务端, 配合 hostfwd 从主机登录)"
+    local src="$SRC_DROPBEAR/dropbear-$DROPBEAR_VER" r
+    # 本地已有对应版本源码目录则直接复用(离线可构建), 否则从官方 GitHub 仓库克隆发布 tag
+    if [ ! -d "$src" ]; then
+        step "dropbear: git clone $DROPBEAR_REPO (tag DROPBEAR_$DROPBEAR_VER, --depth 1)"
+        git clone --depth 1 --branch "DROPBEAR_$DROPBEAR_VER" "$DROPBEAR_REPO" "$src" \
+            || die "dropbear $DROPBEAR_VER 克隆失败: 检查网络与版本号(官方仓库 $DROPBEAR_REPO)"
+    fi
+    [ -x "$src/configure" ] || (cd "$src" && autoreconf) \
+        || die "$src 缺少 configure 且 autoreconf 失败(需安装 autoconf)"
+    if [ ! -x "$src/dropbear" ]; then
+        (cd "$src" \
+            && CC="$CROSS_PREFIX"gcc ./configure --host=aarch64-linux-musl --disable-zlib \
+            && make -j"$J" PROGRAMS="dropbear dbclient dropbearkey dropbearconvert" STATIC=1) \
+            || die "dropbear 编译失败(见上方输出)"
+    fi
+    r="$BUILD/rootfs"
+    install -m 755 "$src/dropbear"    "$r/usr/sbin/dropbear"
+    install -m 755 "$src/dbclient"    "$r/usr/bin/dbclient"
+    install -m 755 "$src/dropbearkey" "$r/usr/sbin/dropbearkey"
+    ${CROSS_PREFIX}strip "$r/usr/sbin/dropbear" "$r/usr/bin/dbclient" "$r/usr/sbin/dropbearkey"
+    prepare_rootfs_ssh
+}
+
+prepare_rootfs_ssh() {
+    local r="$BUILD/rootfs" hash
+    # 账号: root(登录 shell) + sshd(dropbear 特权分离所需用户)
+    cat > "$r/etc/passwd" <<'EOF'
+root:x:0:0:root:/root:/bin/sh
+sshd:x:74:74:Privilege-separated SSH:/var/empty:/bin/false
+EOF
+    cat > "$r/etc/group" <<'EOF'
+root:x:0:
+sshd:x:74:
+EOF
+    # root 密码 root(SHA-512, 构建期生成; 学习环境默认值, 可自行替换)
+    hash="$(openssl passwd -6 root)"
+    printf 'root:%s:19900:0:99999:7:::\n' "$hash" > "$r/etc/shadow"
+    chmod 600 "$r/etc/shadow"
+    mkdir -p "$r/var/empty" "$r/root/.ssh" "$r/etc/dropbear" "$r/dev/pts"
+    chmod 700 "$r/root/.ssh"
+    # host key 构建期生成, 随镜像固定不变(每次开机重新生成会让 known_hosts 反复告警)。
+    # 格式必须是 dropbear 原生二进制: 加载链 readhostkey -> buf_get_priv_key(signkey.c)
+    # 从第 0 字节就按"长度前缀算法名"解析, ssh-keygen 的 OpenSSH 格式无论盔甲还是剥壳的
+    # openssh-key-v1, 前 4 字节都会被当成字符串长度读 -> "String too long"; OpenSSH 格式
+    # 只有 dropbearconvert 认。交叉编译出的 dropbearkey 是静态 aarch64, 用 qemu-aarch64
+    # 在构建机上直接运行即可产出原生格式密钥。
+    mkdir -p "$r/etc/dropbear" && rm -f "$r/etc/dropbear/"*    # 非交互: 先清掉旧密钥
+    command -v qemu-aarch64 >/dev/null \
+        || die "构建期生成 host key 需要 qemu-aarch64(qemu-user 包), 用于运行 aarch64 版 dropbearkey"
+    qemu-aarch64 "$r/usr/sbin/dropbearkey" -t ed25519 -f "$r/etc/dropbear/dropbear_ed25519_host_key" >/dev/null \
+        && qemu-aarch64 "$r/usr/sbin/dropbearkey" -t rsa -s 2048 -f "$r/etc/dropbear/dropbear_rsa_host_key" >/dev/null \
+        || die "dropbearkey 生成 host key 失败"
+    ok "SSH 配置: root/root (SHA-512), host key(ed25519+rsa, dropbear 原生格式) 已随镜像内置"
 }
 
 pack_initramfs() {    # $1 = 输出文件
@@ -237,6 +305,7 @@ do_build() {
     build_busybox
     build_uboot
     build_kernel
+    build_dropbear
     make_rootfs_verify
     make_rootfs_shell
     verify_build
@@ -257,8 +326,8 @@ setup_net_single() {
         -device "virtio-net-pci,netdev=net0,mac=$NET_MAC_USR"
     )
     ok "网络: 单网卡 SLIRP (guest 10.0.2.15/24, NAT 出网)"
-    ok "SSH 转发: 主机 $VM_SSH_FWD -> guest 22 (guest 需运行 sshd, 如 dropbear)"
-    ok "SSH 登录: ssh -p 2222 root@127.0.0.1 (容器外: ssh -p 2222 root@<容器IP>)"
+    ok "SSH 转发: 主机 $VM_SSH_FWD -> guest 22 (dropbear 已预装, 开机自启)"
+    ok "SSH 登录: ssh -p 2222 root@127.0.0.1, 密码 root (容器外: ssh -p 2222 root@<容器IP>)"
 }
 
 setup_net_icmp() {
