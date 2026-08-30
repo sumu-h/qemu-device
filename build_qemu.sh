@@ -18,6 +18,15 @@
 #   build/rootfs.cpio.gz            initramfs 自动验证版(-r test), 零填充到固定 4MiB
 #   build/rootfs-shell.cpio.gz      initramfs 交互终端版(-r), 零填充到固定 4MiB
 #   out/boot.log                    最近一次 QEMU 串口日志
+#   out/vm-net.log                  主机<->虚拟机网桥守护进程日志 (vm-net.py)
+#
+# 网络拓扑(主机 <-> 虚拟机互通):
+#   guest eth0 (52:54:00:CA:FE:01) 192.168.100.2/24 <-> 主机 vm-net.py 网桥 192.168.100.1/24
+#       guest 侧: ping 192.168.100.1
+#       主机  侧: python3 vm-net.py ping 192.168.100.2
+#       (本容器无 CAP_NET_ADMIN 建不了 TAP, 故用 -netdev socket + 用户态 ICMP 网桥实现,
+#        在有权限的主机上可自行改回 tap 直连; guest 不能配 172.17.0.x —— SLIRP 下主机不可见)
+#   guest eth1 (52:54:00:CA:FE:02) 10.0.2.15/24 -> SLIRP NAT 出网(网关 10.0.2.2)
 #
 # 注: build/rootfs/init 与 etc/inittab 均由本脚本在每次 -b 时重新写入,
 #     如需定制请修改下方 gen_init(验证版) / gen_init_shell(交互版)。
@@ -48,6 +57,13 @@ INITRAMFS_SHELL="$BUILD/rootfs-shell.cpio.gz" # 交互终端版(-r): busybox ini
 INITRAMFS_SIZE=$((4 * 1024 * 1024))    # 0x400000, 与 u-boot qemu_defconfig 的 BOOTCOMMAND 对应
 CROSS_PREFIX="aarch64-linux-musl-"
 J="$(nproc)"
+# --- 主机 <-> 虚拟机互通网络 (用户态 ICMP 网桥, 详见 vm-net.py 文件头) ---
+NET_MAC_BR="52:54:00:CA:FE:01"    # guest eth0: 主机<->guest 直连通道
+NET_MAC_USR="52:54:00:CA:FE:02"   # guest eth1: SLIRP 出网
+VM_NET_HOST_IP="192.168.100.1"    # 网桥(主机侧) IP, guest 可直接 ping
+VM_NET_GUEST_IP="192.168.100.2"   # guest eth0 IP
+VM_NET_QEMU_PORT="${VM_NET_QEMU_PORT:-47777}"   # QEMU -netdev socket 帧通道
+VM_NET_CTRL_PORT="${VM_NET_CTRL_PORT:-47778}"   # vm-net.py ping 控制通道
 
 step()  { echo -e "\e[96m➤  $*\e[0m"; }
 ok()    { echo "  ✅ $*"; }
@@ -106,6 +122,20 @@ EOF
     cat > "$BUILD/rootfs/etc/rc.sh" <<'EOF'
 #!/bin/sh
 hostname qemu-virt
+ifconfig lo up 2>/dev/null
+# 按固定 MAC 配网(与 build_qemu.sh 中 -device ...mac= 一致):
+#   52:54:00:ca:fe:01 -> 主机<->guest 直连网桥: 192.168.100.2/24 (对端主机 192.168.100.1)
+#   52:54:00:ca:fe:02 -> QEMU SLIRP 出网: 10.0.2.15/24, 网关 10.0.2.2
+for n in /sys/class/net/eth*; do
+    [ -e "$n" ] || continue
+    case "$(cat "$n/address")" in
+        52:54:00:ca:fe:01) ifconfig "${n##*/}" 192.168.100.2 netmask 255.255.255.0 up ;;
+        52:54:00:ca:fe:02)
+            ifconfig "${n##*/}" 10.0.2.15 netmask 255.255.255.0 up
+            route add default gw 10.0.2.2 2>/dev/null
+            ;;
+    esac
+done
 EOF
     chmod 755 "$BUILD/rootfs/etc/rc.sh"
 }
@@ -211,6 +241,44 @@ do_build() {
     step "全部完成: ./build_qemu.sh -r 交互终端 | ./build_qemu.sh -r test 启动验证"
 }
 
+# ---------------------------------------------------------------------------
+# 主机 <-> 虚拟机网络: 用户态 ICMP 网桥 (见文件头"网络拓扑"与 vm-net.py)
+# 容器无 CAP_NET_ADMIN 建不了 TAP, 故用 -netdev socket + vm-net.py 在用户态
+# 终结二层(最小 ARP/ICMP), 实现 guest 与主机真实互 ping; 失败则回退纯 SLIRP。
+# ---------------------------------------------------------------------------
+setup_vm_net() {
+    NET_ARGS=()
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "无 python3, 主机<->guest 网桥不可用, 仅保留 SLIRP 出网"
+        return 1
+    fi
+    if ! [ -f "$ROOT/vm-net.py" ]; then
+        warn "缺少 $ROOT/vm-net.py, 主机<->guest 网桥不可用, 仅保留 SLIRP 出网"
+        return 1
+    fi
+    mkdir -p "$OUT"
+    if ! python3 "$ROOT/vm-net.py" probe >/dev/null 2>&1; then
+        step "启动主机<->虚拟机网络网桥 (用户态 ICMP 网桥 vm-net.py)"
+        nohup python3 "$ROOT/vm-net.py" daemon >> "$OUT/vm-net.log" 2>&1 &
+    fi
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        python3 "$ROOT/vm-net.py" probe >/dev/null 2>&1 && break
+        sleep 0.3
+    done
+    if ! python3 "$ROOT/vm-net.py" probe >/dev/null 2>&1; then
+        warn "网桥守护进程启动失败(见 $OUT/vm-net.log), 回退仅 SLIRP"
+        return 1
+    fi
+    ok "网桥就绪: 主机 $VM_NET_HOST_IP <-> guest $VM_NET_GUEST_IP/24 (eth0)"
+    ok "主机侧 ping 虚拟机: python3 $ROOT/vm-net.py ping $VM_NET_GUEST_IP"
+    NET_ARGS=(
+        -netdev "socket,id=net0,connect=127.0.0.1:$VM_NET_QEMU_PORT"
+        -device "virtio-net-pci,netdev=net0,mac=$NET_MAC_BR"
+        -netdev "user,id=net1"
+        -device "virtio-net-pci,netdev=net1,mac=$NET_MAC_USR"
+    )
+}
+
 do_run() {
     # -r [test] [qemu参数]: 默认交互终端; 参数为 test 时进入验证模式(VERIFY 标记 + 自动关机)
     local verify=0 a
@@ -251,6 +319,8 @@ do_run() {
     fi
     [ "$fail" -eq 0 ] || die "成果物检查未通过, 请先执行 ./build_qemu.sh -b"
 
+    setup_vm_net || true
+
     if [ "$verify" -eq 1 ]; then
         # 验证模式保持单发语义: panic/reboot 不重启虚拟机而是退出 QEMU, 回归不会死循环
         qemu_args=("-no-reboot" "${qemu_args[@]}")
@@ -270,6 +340,7 @@ do_run() {
         -bios "$BUILD/uboot/u-boot.bin" \
         -device loader,file="$BUILD/kernel/arch/arm64/boot/Image",addr=0x44000000,force-raw=on \
         -device loader,file="$cpio",addr=0x60000000,force-raw=on \
+        "${NET_ARGS[@]}" \
         "${qemu_args[@]}" 2>&1 | tee "$OUT/boot.log"
     local rc=$?
     set -e
