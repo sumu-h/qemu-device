@@ -1,0 +1,41 @@
+digraph topology {
+  fontname="Noto Sans CJK SC";
+  graph [fontname="Noto Sans CJK SC", label="总体拓扑：用户态 ICMP 网桥打通主机与虚拟机", labelloc="t",
+         fontsize=16, fontcolor="#1F2933", bgcolor="white", rankdir=LR,
+         compound=true, nodesep=0.5, ranksep=0.8];
+  node [fontname="Noto Sans CJK SC", shape=box, style="rounded,filled",
+        fillcolor="#F7F9FC", color="#7A93BE", fontcolor="#1F2933", fontsize=12];
+  edge [fontname="Noto Sans CJK SC", color="#5A5A5A", fontcolor="#333333", fontsize=11];
+
+  subgraph cluster_host {
+    label="主机容器 · 用户态（缺 CAP_NET_ADMIN，内核无 TAP/网桥）";
+    style="rounded"; color="#7A93BE"; fontcolor="#1F2933";
+    vmping [label="vm-ping 子命令\n(用户终端)", fillcolor="#DCE9FB"];
+    bridge [label="vm-net.py 网桥  192.168.100.1/24\nMAC 52:54:00:99:00:01", fillcolor="#DDF3E4"];
+  }
+
+  subgraph cluster_qemu {
+    label="QEMU 进程 · 用户态";
+    style="rounded"; color="#7A93BE"; fontcolor="#1F2933";
+    sockdev [label="socket 网卡后端\n-netdev socket,id=net0", fillcolor="#DDF3E4"];
+    slirp   [label="SLIRP 用户态 NAT\n-netdev user,id=net1", fillcolor="#DDF3E4"];
+  }
+
+  subgraph cluster_guest {
+    label="虚拟机内核 (QEMU virt)";
+    style="rounded"; color="#7A93BE"; fontcolor="#1F2933";
+    eth0 [label="eth0  192.168.100.2/24\nvirtio-net-pci · MAC 52:54:00:CA:FE:01"];
+    eth1 [label="eth1  10.0.2.15/24\nvirtio-net-pci · MAC 52:54:00:CA:FE:02"];
+  }
+
+  hosteth  [label="容器网络命名空间\neth0 172.17.0.12/16", fillcolor="#FFF3D6"];
+  internet [label="外部网络", fillcolor="#FFF3D6"];
+
+  vmping  -> bridge   [dir=both, label="控制通道\nTCP 127.0.0.1:47778"];
+  bridge  -> sockdev  [dir=both, label="帧通道 TCP 127.0.0.1:47777\n4字节长度前缀 + 以太网帧"];
+  sockdev -> eth0     [dir=both, label="virtio"];
+  sockdev -> slirp    [style=invis];
+  slirp   -> eth1     [dir=both, label="virtio"];
+  slirp   -> hosteth  [dir=both, label="NAT"];
+  hosteth -> internet [label="出网"];
+}

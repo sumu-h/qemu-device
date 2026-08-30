@@ -1,0 +1,20 @@
+digraph frame_format {
+  fontname="Noto Sans CJK SC";
+  graph [fontname="Noto Sans CJK SC", label="帧通道封装格式与网桥处理规则", labelloc="t",
+         fontsize=16, fontcolor="#1F2933", bgcolor="white",
+         nodesep=0.4, ranksep=0.7];
+  node [fontname="Noto Sans CJK SC", shape=box, style="rounded,filled",
+        fillcolor="#F7F9FC", color="#7A93BE", fontcolor="#1F2933", fontsize=12];
+  edge [fontname="Noto Sans CJK SC", color="#5A5A5A", fontcolor="#333333", fontsize=11];
+
+  wire [shape=record, style=filled, fillcolor="#DDF3E4", color="#7A93BE",
+        label="{4字节长度前缀|大端 uint32\n首帧自动探测}|{目的MAC|6字节}|{源MAC|6字节}|{类型|0x0806 ARP\n0x0800 IPv4}|{载荷|46~1500字节\nARP 28B / IP 包}"];
+
+  arp   [label="ARP 帧：who-has 192.168.100.1\n→ 网桥以自身 MAC 构造 reply", fillcolor="#DCE9FB"];
+  icmp8 [label="ICMP type=8，目的=网桥 IP\n→ 构造 echo reply 直接应答（终结）", fillcolor="#DCE9FB"];
+  icmp0 [label="ICMP type=0，源=guest\n→ 按 (ident,seq) 匹配 vm-ping，算 RTT", fillcolor="#DCE9FB"];
+
+  wire -> arp   [label="类型=0x0806"];
+  wire -> icmp8 [label="类型=0x0800 · ICMP type=8"];
+  wire -> icmp0 [label="类型=0x0800 · ICMP type=0"];
+}

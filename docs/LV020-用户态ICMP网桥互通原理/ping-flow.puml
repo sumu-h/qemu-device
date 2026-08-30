@@ -1,0 +1,52 @@
+@startuml ping-flow
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam ArrowColor #5A5A5A
+skinparam ArrowFontColor #333333
+skinparam ArrowFontSize 12
+skinparam SequenceParticipantBorderColor #7A93BE
+skinparam SequenceParticipantBackgroundColor #DCE9FB
+skinparam SequenceParticipantFontColor #1F2933
+skinparam SequenceLifeLineBorderColor #7A93BE
+skinparam SequenceGroupBackgroundColor #F7F9FC
+skinparam SequenceGroupBorderColor #7A93BE
+skinparam NoteBackgroundColor #FFFBE6
+skinparam NoteBorderColor #E0B400
+skinparam NoteFontColor #5C4A00
+
+title 双向 ping 数据流
+
+participant "vm-ping 终端\n(主机)" as U
+participant "vm-net.py 网桥\n(192.168.100.1)" as BR
+participant "QEMU 进程\n(socket 后端)" as Q
+participant "guest 内核\n(eth0 · 192.168.100.2)" as G
+
+== 阶段① 虚拟机 → 主机：guest ping 192.168.100.1 ==
+
+G -> Q : ARP 请求 who-has 192.168.100.1
+Q -> BR : 原帧转发（帧通道）
+BR --> Q : ARP reply（网桥 MAC 52:54:00:99:00:01）
+Q -> G : 注入 eth0
+G -> Q : ICMP echo request（id, seq）
+Q -> BR : 原帧转发
+BR --> Q : ICMP echo reply（同 id/seq）
+Q -> G : 注入 eth0
+note over G : ping 报告 0% 丢包
+
+== 阶段② 主机 → 虚拟机：vm-ping 192.168.100.2 ==
+
+U -> BR : PING ident seq（控制通道 47778）
+BR -> Q : ICMP echo request（目的 = guest MAC）
+Q -> G : 注入 eth0
+G --> Q : ICMP echo reply（同 id/seq）
+Q -> BR : 原帧转发
+BR --> U : REPLY rtt=0.78 ms（按 ident/seq 匹配）
+
+legend right
+  实线 = 请求 / 转发
+  虚线 = 应答
+endlegend
+
+@enduml
