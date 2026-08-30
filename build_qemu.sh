@@ -4,9 +4,10 @@
 #
 # 用法:
 #   ./build_qemu.sh -b              编译三个成果物(busybox/u-boot/kernel)并打包 initramfs
-#   ./build_qemu.sh -r [qemu参数]   启动虚拟板卡进入交互式串口终端
+#   ./build_qemu.sh -r [--net=icmp] 启动虚拟板卡进入交互式串口终端
 #                                   (exit 退出 shell 自动重生; poweroff 关机; reset 真重启;
 #                                    Ctrl-A x 强退 QEMU; 其余参数原样传给 qemu, 如 -S -s 配合 gdb)
+#                                   默认单网卡 SLIRP(hostfwd 2222→22 供 SSH); --net=icmp 加网桥互 ping
 #   ./build_qemu.sh -r test         验证模式: 自动执行 VERIFY 标记检查并关机(回归用)
 #   ./build_qemu.sh -c              删除构建产物(build/ 与 out/)
 #   ./build_qemu.sh -h              帮助
@@ -20,13 +21,13 @@
 #   out/boot.log                    最近一次 QEMU 串口日志
 #   out/vm-net.log                  主机<->虚拟机网桥守护进程日志 (vm-net.py)
 #
-# 网络拓扑(主机 <-> 虚拟机互通):
-#   guest eth0 (52:54:00:CA:FE:01) 192.168.100.2/24 <-> 主机 vm-net.py 网桥 192.168.100.1/24
-#       guest 侧: ping 192.168.100.1
-#       主机  侧: python3 vm-net.py ping 192.168.100.2
-#       (本容器无 CAP_NET_ADMIN 建不了 TAP, 故用 -netdev socket + 用户态 ICMP 网桥实现,
-#        在有权限的主机上可自行改回 tap 直连; guest 不能配 172.17.0.x —— SLIRP 下主机不可见)
-#   guest eth1 (52:54:00:CA:FE:02) 10.0.2.15/24 -> SLIRP NAT 出网(网关 10.0.2.2)
+# 网络拓扑(两种模式, 由 -r 的 --net=icmp 切换):
+#   默认 -r        单网卡 SLIRP: guest 10.0.2.15/24 (MAC ...:FE:02), 出网走 NAT(网关 10.0.2.2);
+#                  hostfwd 把主机 2222 端口转发到 guest 22 —— guest 装 dropbear 后:
+#                  ssh -p 2222 root@127.0.0.1 (容器外: ssh -p 2222 root@<容器IP>)
+#   -r --net=icmp  加一块 eth0 走 vm-net.py 用户态 ICMP 网桥(192.168.100.2/24 <-> 主机 192.168.100.1):
+#                  主机侧 python3 vm-net.py ping 192.168.100.2; guest 侧 ping 192.168.100.1
+#                  (本容器无 CAP_NET_ADMIN 建不了 TAP, 网桥为用户态实现; guest 不能配 172.17.0.x)
 #
 # 注: build/rootfs/init 与 etc/inittab 均由本脚本在每次 -b 时重新写入,
 #     如需定制请修改下方 gen_init(验证版) / gen_init_shell(交互版)。
@@ -57,13 +58,14 @@ INITRAMFS_SHELL="$BUILD/rootfs-shell.cpio.gz" # 交互终端版(-r): busybox ini
 INITRAMFS_SIZE=$((4 * 1024 * 1024))    # 0x400000, 与 u-boot qemu_defconfig 的 BOOTCOMMAND 对应
 CROSS_PREFIX="aarch64-linux-musl-"
 J="$(nproc)"
-# --- 主机 <-> 虚拟机互通网络 (用户态 ICMP 网桥, 详见 vm-net.py 文件头) ---
+# --- 虚拟机网络(默认单网卡 SLIRP+SSH; --net=icmp 启用用户态网桥, 详见 vm-net.py 文件头) ---
 NET_MAC_BR="52:54:00:CA:FE:01"    # guest eth0: 主机<->guest 直连通道
 NET_MAC_USR="52:54:00:CA:FE:02"   # guest eth1: SLIRP 出网
 VM_NET_HOST_IP="192.168.100.1"    # 网桥(主机侧) IP, guest 可直接 ping
 VM_NET_GUEST_IP="192.168.100.2"   # guest eth0 IP
-VM_NET_QEMU_PORT="${VM_NET_QEMU_PORT:-47777}"   # QEMU -netdev socket 帧通道
-VM_NET_CTRL_PORT="${VM_NET_CTRL_PORT:-47778}"   # vm-net.py ping 控制通道
+VM_NET_QEMU_PORT="${VM_NET_QEMU_PORT:-47777}"   # QEMU -netdev socket 帧通道(仅 --net=icmp 用)
+VM_NET_CTRL_PORT="${VM_NET_CTRL_PORT:-47778}"   # vm-net.py ping 控制通道(仅 --net=icmp 用)
+VM_SSH_FWD="${VM_SSH_FWD:-tcp::2222-:22}"       # SSH 转发(默认绑 0.0.0.0; 仅容器内用可改 tcp:127.0.0.1:2222-:22)
 
 step()  { echo -e "\e[96m➤  $*\e[0m"; }
 ok()    { echo "  ✅ $*"; }
@@ -71,7 +73,7 @@ warn()  { echo -e "  ⚠️  $*"; }
 error() { echo -e "  ❌ $*" >&2; }
 die()   { error "$*"; exit 1; }
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------------------
 # init 脚本: 挂载伪文件系统 -> 打印验证标记 -> 关机(QEMU 以 exit 0 干净退出)
@@ -242,11 +244,24 @@ do_build() {
 }
 
 # ---------------------------------------------------------------------------
-# 主机 <-> 虚拟机网络: 用户态 ICMP 网桥 (见文件头"网络拓扑"与 vm-net.py)
-# 容器无 CAP_NET_ADMIN 建不了 TAP, 故用 -netdev socket + vm-net.py 在用户态
-# 终结二层(最小 ARP/ICMP), 实现 guest 与主机真实互 ping; 失败则回退纯 SLIRP。
+# 虚拟机网络设置(由 -r 的 --net=icmp 选择):
+#   setup_net_single  默认: 单网卡 SLIRP + hostfwd 端口转发(SSH 等 TCP 入站), 无外部依赖;
+#   setup_net_icmp    双网卡: eth0 走 -netdev socket + vm-net.py 用户态网桥实现主机与
+#                     guest 真实互 ping(容器无 CAP_NET_ADMIN 建不了 TAP), eth1 同默认模式;
+#                     网桥不可用时回退为单网卡。
+# 两种模式的 guest IP 均由 rc.sh 按固定 MAC 配置(见 gen_init_shell), 与网卡顺序解耦。
 # ---------------------------------------------------------------------------
-setup_vm_net() {
+setup_net_single() {
+    NET_ARGS=(
+        -netdev "user,id=net0,hostfwd=$VM_SSH_FWD"
+        -device "virtio-net-pci,netdev=net0,mac=$NET_MAC_USR"
+    )
+    ok "网络: 单网卡 SLIRP (guest 10.0.2.15/24, NAT 出网)"
+    ok "SSH 转发: 主机 $VM_SSH_FWD -> guest 22 (guest 需运行 sshd, 如 dropbear)"
+    ok "SSH 登录: ssh -p 2222 root@127.0.0.1 (容器外: ssh -p 2222 root@<容器IP>)"
+}
+
+setup_net_icmp() {
     NET_ARGS=()
     if ! command -v python3 >/dev/null 2>&1; then
         warn "无 python3, 主机<->guest 网桥不可用, 仅保留 SLIRP 出网"
@@ -280,12 +295,15 @@ setup_vm_net() {
 }
 
 do_run() {
-    # -r [test] [qemu参数]: 默认交互终端; 参数为 test 时进入验证模式(VERIFY 标记 + 自动关机)
-    local verify=0 a
+    # -r [--net=icmp] [test] [qemu参数]: 默认单网卡(SLIRP+SSH 转发); --net=icmp 启用用户态网桥;
+    # 参数为 test 时进入验证模式(VERIFY 标记 + 自动关机)
+    local verify=0 net_icmp=0 a
     local qemu_args=()
     for a in "$@"; do
         case "$a" in
             test) verify=1 ;;
+            --net=icmp) net_icmp=1 ;;
+            --net=*) die "未知网络模式 '$a' (仅支持 --net=icmp)" ;;
             *) qemu_args+=("$a") ;;
         esac
     done
@@ -319,7 +337,11 @@ do_run() {
     fi
     [ "$fail" -eq 0 ] || die "成果物检查未通过, 请先执行 ./build_qemu.sh -b"
 
-    setup_vm_net || true
+    if [ "$net_icmp" -eq 1 ]; then
+        setup_net_icmp || true
+    else
+        setup_net_single
+    fi
 
     if [ "$verify" -eq 1 ]; then
         # 验证模式保持单发语义: panic/reboot 不重启虚拟机而是退出 QEMU, 回归不会死循环
