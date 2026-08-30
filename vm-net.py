@@ -171,19 +171,29 @@ class Bridge:
         while True:
             sock, _ = srv.accept()
             with self.lock:
-                if self.qemu is not None:
-                    try:
-                        self.qemu.close()
-                    except OSError:
-                        pass
-                self.qemu, self.len_order = sock, None
-            log("QEMU 已接入")
-            try:
-                while True:
-                    frame = self._read_frame(sock)
-                    threading.Thread(target=self._handle, args=(frame,), daemon=True).start()
-            except (ConnectionError, OSError):
-                pass
+                old, self.qemu, self.len_order = self.qemu, sock, None
+            if old is not None:
+                try:
+                    old.close()          # 新连接接管, 旧读线程随 recv 异常退出
+                except OSError:
+                    pass
+                log("QEMU 已接入 (新连接接管, 旧连接已关闭)")
+            else:
+                log("QEMU 已接入")
+            threading.Thread(target=self._read_loop, args=(sock,), daemon=True).start()
+
+    def _read_loop(self, sock):
+        """每个连接一个读线程; 被更新的连接取代后立即退出, 避免旧连接饿死新连接"""
+        try:
+            while True:
+                with self.lock:
+                    if self.qemu is not sock:
+                        return
+                frame = self._read_frame(sock)
+                threading.Thread(target=self._handle, args=(frame,), daemon=True).start()
+        except (ConnectionError, OSError):
+            pass
+        finally:
             with self.lock:
                 if self.qemu is sock:
                     self.qemu = None
