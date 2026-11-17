@@ -12,6 +12,9 @@
 #                                      all     以上四项(顺序 rootfs→kernel→uboot→qemu)
 #                                    -b 可重复, 也可逗号分隔: -b kernel,rootfs
 #   ./build_mcimx6ul.sh -r            启动板卡, 交互式串口 shell(exit 退出后自动重生)
+#   ./build_mcimx6ul.sh -r uboot      改走 U-Boot 引导: QEMU 把 dtb/zImage/initramfs 预载到
+#                                   0x8B000000/0x8C000000/0x90000000, u-boot 的 bootcmd
+#                                   直接 bootz(需先 -b uboot); 可叠加 test
 #   ./build_mcimx6ul.sh -r test       验证模式: 打印 VERIFY 标记后自动关机(回归用)
 #                                   带看门狗: 连续 30s 无串口输出即强杀(IDLE_TIMEOUT=秒 可改),
 #                                   总时长上限 180s(TOTAL_TIMEOUT=秒 可改)
@@ -87,13 +90,25 @@ DTB_SRC="$BUILD/kernel/arch/arm/boot/dts/nxp/imx/$KERNEL_DTB.dtb"
 DTB="$BUILD/$KERNEL_DTB.dtb"
 QEMU_BIN="$BUILD/qemu-install/bin/qemu-system-arm"
 
+# --- u-boot 引导模式(-r uboot): 镜像由 QEMU 预载到 RAM, u-boot 的 bootcmd 直接 bootz ---
+# 地址必须与 u-boot 的 CONFIG_BOOTCOMMAND 一致(u-boot/configs/mcimx6ul_defconfig)
+# 取值放在 u-boot 映像(0x87800000)之上的空闲区: 实测 0x81000000~0x84000000 会被
+# u-boot 自身启动过程覆盖, 换到 0x8B000000 以上才稳定
+UBOOT_ELF="$BUILD/uboot/u-boot"
+UBOOT_RAM_DTB="0x8B000000"
+UBOOT_RAM_ZIMAGE="0x8C000000"
+UBOOT_RAM_INITRD="0x90000000"
+UBOOT_INITRD_SIZE=$((4 * 1024 * 1024))   # 0x400000: bootz 里的 initrd 长度写死成这个值
+INITRAMFS_UBOOT="$BUILD/rootfs-uboot.cpio.gz"
+INITRAMFS_UBOOT_TEST="$BUILD/rootfs-test-uboot.cpio.gz"
+
 step()  { echo -e "\e[96m➤  $*\e[0m"; }
 ok()    { echo "  ✅ $*"; }
 warn()  { echo -e "  ⚠️  $*"; }
 error() { echo -e "  ❌ $*" >&2; }
 die()   { error "$*"; exit 1; }
 
-usage() { sed -n '5,20p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '5,23p' "$0" | sed 's/^# \{0,1\}//'; }
 
 need_cross() {
     command -v "${CROSS_ARM}gcc" >/dev/null 2>&1 \
@@ -218,6 +233,14 @@ build_rootfs() {
     pack_initramfs "$INITRAMFS"
     gen_init_shell
     pack_initramfs "$INITRAMFS_SHELL"
+
+    # u-boot 的 bootz 需要知道 initrd 长度, 而 u-boot 里取不到宿主文件大小,
+    # 所以给 u-boot 引导模式另存两份零填充到固定 4MiB 的副本(gunzip 会忽略尾部零)。
+    cp -f "$INITRAMFS" "$INITRAMFS_UBOOT_TEST"
+    cp -f "$INITRAMFS_SHELL" "$INITRAMFS_UBOOT"
+    truncate -s "$UBOOT_INITRD_SIZE" "$INITRAMFS_UBOOT_TEST"
+    truncate -s "$UBOOT_INITRD_SIZE" "$INITRAMFS_UBOOT"
+    ok "u-boot 引导用 initramfs: $(basename "$INITRAMFS_UBOOT") / $(basename "$INITRAMFS_UBOOT_TEST") (各 $UBOOT_INITRD_SIZE 字节)"
 }
 
 # ---------------------------------------------------------------------------
@@ -259,7 +282,7 @@ build_uboot() {
     ok "u-boot-dtb.bin: $(stat -c%s "$u/u-boot-dtb.bin") 字节"
     [ -s "$u/u-boot-with-spl.imx" ] \
         && ok "u-boot-with-spl.imx: $(stat -c%s "$u/u-boot-with-spl.imx") 字节(真板 SD 引导用)"
-    warn "本板 QEMU 无 BootROM/pflash, u-boot 不能作为 -bios 使用; -r 走 zImage 直启"
+    warn "本板无 BootROM/pflash, u-boot 不能作为 -bios; 用 -r uboot 走 bootz 预载引导"
 }
 
 # ---------------------------------------------------------------------------
@@ -298,21 +321,27 @@ pick_qemu() {
 }
 
 do_run() {
-    local verify=0 a
+    local verify=0 uboot=0 a
     local extra=()
     for a in "$@"; do
         case "$a" in
             test) verify=1 ;;
+            uboot) uboot=1 ;;
             *) extra+=("$a") ;;
         esac
     done
 
-    local cpio="$INITRAMFS_SHELL" cmdline
-    if [ "$verify" -eq 1 ]; then
-        cpio="$INITRAMFS"
-        cmdline="console=$CONSOLE,115200 rdinit=/init loglevel=7 panic=1"
+    local cpio cmdline=""
+    if [ "$uboot" -eq 1 ]; then
+        # u-boot 引导: initramfs 需零填充到固定长度(bootcmd 里写死 0x400000),
+        # 内核由 QEMU 预载到 RAM, 不经 -dtb/-initrd 直启参数
+        cpio="$INITRAMFS_UBOOT"
+        [ "$verify" -eq 0 ] || cpio="$INITRAMFS_UBOOT_TEST"
     else
+        cpio="$INITRAMFS_SHELL"
+        [ "$verify" -eq 0 ] || cpio="$INITRAMFS"
         cmdline="console=$CONSOLE,115200 rdinit=/init loglevel=7"
+        [ "$verify" -eq 0 ] || cmdline="$cmdline panic=1"
     fi
 
     step "检查成果物"
@@ -334,10 +363,22 @@ do_run() {
     else
         error "$(basename "$cpio") 缺失或缺少 /init, 请先 -b rootfs"; fail=1
     fi
+    if [ "$uboot" -eq 1 ]; then
+        if [ -f "$UBOOT_ELF" ]; then
+            ok "u-boot: $(stat -c%s "$UBOOT_ELF") 字节 (ELF, 走 bootz 预载引导)"
+        else
+            error "缺少 u-boot: $UBOOT_ELF, 请先 -b uboot"; fail=1
+        fi
+    fi
     [ "$fail" -eq 0 ] || die "成果物检查未通过"
 
     mkdir -p "$OUT"
-    if [ "$verify" -eq 1 ]; then
+    if [ "$uboot" -eq 1 ] && [ "$verify" -eq 1 ]; then
+        step "启动 $MACHINE [u-boot 引导 + 验证模式] (u-boot 跑 bootcmd -> bootz; 日志: $OUT/boot.log)"
+        extra=(-no-reboot "${extra[@]}")
+    elif [ "$uboot" -eq 1 ]; then
+        step "启动 $MACHINE [u-boot 引导] (u-boot 跑 bootcmd -> bootz; exit 重生 shell)"
+    elif [ "$verify" -eq 1 ]; then
         step "启动 $MACHINE [验证模式] (打 VERIFY 标记后自动关机; 日志: $OUT/boot.log)"
         extra=(-no-reboot "${extra[@]}")
     else
@@ -345,9 +386,21 @@ do_run() {
     fi
 
     # 验证模式加"无输出看门狗": 内核/固件静默挂死时不能一直占着终端
-    local -a run_cmd=("$qemu" -M "$MACHINE" -m 512M -nographic
-                      -kernel "$ZIMAGE" -dtb "$DTB" -initrd "$cpio"
-                      -append "$cmdline" "${extra[@]}")
+    local -a run_cmd
+    if [ "$uboot" -eq 1 ]; then
+        # u-boot 自己不起来任何设备树/镜像, 三个 blob 由 QEMU 预载到约定地址,
+        # u-boot 的 bootcmd 直接从这些地址 bootz
+        run_cmd=("$qemu" -M "$MACHINE" -m 512M -nographic
+                 -kernel "$UBOOT_ELF"
+                 -device "loader,file=$DTB,addr=$UBOOT_RAM_DTB,force-raw=on"
+                 -device "loader,file=$ZIMAGE,addr=$UBOOT_RAM_ZIMAGE,force-raw=on"
+                 -device "loader,file=$cpio,addr=$UBOOT_RAM_INITRD,force-raw=on"
+                 "${extra[@]}")
+    else
+        run_cmd=("$qemu" -M "$MACHINE" -m 512M -nographic
+                 -kernel "$ZIMAGE" -dtb "$DTB" -initrd "$cpio"
+                 -append "$cmdline" "${extra[@]}")
+    fi
     if [ "$verify" -eq 1 ] && [ -x "$ROOT/tools/idle-timeout.sh" ]; then
         run_cmd=("$ROOT/tools/idle-timeout.sh" -i "$IDLE_TIMEOUT" -t "$TOTAL_TIMEOUT"
                  -- "${run_cmd[@]}")
