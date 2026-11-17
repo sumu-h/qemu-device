@@ -13,6 +13,8 @@
 #                                    -b 可重复, 也可逗号分隔: -b kernel,rootfs
 #   ./build_mcimx6ul.sh -r            启动板卡, 交互式串口 shell(exit 退出后自动重生)
 #   ./build_mcimx6ul.sh -r test       验证模式: 打印 VERIFY 标记后自动关机(回归用)
+#                                   带看门狗: 连续 30s 无串口输出即强杀(IDLE_TIMEOUT=秒 可改),
+#                                   总时长上限 180s(TOTAL_TIMEOUT=秒 可改)
 #   ./build_mcimx6ul.sh -r -S -s      其余参数原样传给 qemu(例: -S -s 配合 gdb)
 #   ./build_mcimx6ul.sh -c            删除构建产物(build-mcimx6ul/ 与 out-mcimx6ul/)
 #   ./build_mcimx6ul.sh -h            帮助
@@ -74,6 +76,9 @@ BUSYBOX_DEFCONFIG="$SRC_BUSYBOX/configs/mcimx6ul_defconfig"
 KERNEL_DTB="imx6ul-14x14-evk"
 CONSOLE="ttymxc0"
 J="$(nproc)"
+# -r test 的看门狗: 连续 IDLE_TIMEOUT 秒无串口输出即判定卡死强杀, 总时长上限 TOTAL_TIMEOUT
+IDLE_TIMEOUT="${IDLE_TIMEOUT:-30}"
+TOTAL_TIMEOUT="${TOTAL_TIMEOUT:-180}"
 
 INITRAMFS="$BUILD/rootfs-test.cpio.gz"      # 自动验证版(-r test): VERIFY 标记 + poweroff
 INITRAMFS_SHELL="$BUILD/rootfs-shell.cpio.gz"  # 交互终端版(-r): busybox init + 常驻 shell
@@ -88,7 +93,7 @@ warn()  { echo -e "  ⚠️  $*"; }
 error() { echo -e "  ❌ $*" >&2; }
 die()   { error "$*"; exit 1; }
 
-usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '5,20p' "$0" | sed 's/^# \{0,1\}//'; }
 
 need_cross() {
     command -v "${CROSS_ARM}gcc" >/dev/null 2>&1 \
@@ -339,13 +344,17 @@ do_run() {
         step "启动 $MACHINE [交互终端] (exit 重生 shell; poweroff 关机; Ctrl-A x 强退)"
     fi
 
+    # 验证模式加"无输出看门狗": 内核/固件静默挂死时不能一直占着终端
+    local -a run_cmd=("$qemu" -M "$MACHINE" -m 512M -nographic
+                      -kernel "$ZIMAGE" -dtb "$DTB" -initrd "$cpio"
+                      -append "$cmdline" "${extra[@]}")
+    if [ "$verify" -eq 1 ] && [ -x "$ROOT/tools/idle-timeout.sh" ]; then
+        run_cmd=("$ROOT/tools/idle-timeout.sh" -i "$IDLE_TIMEOUT" -t "$TOTAL_TIMEOUT"
+                 -- "${run_cmd[@]}")
+    fi
+
     set +e
-    "$qemu" -M "$MACHINE" -m 512M -nographic \
-        -kernel "$ZIMAGE" \
-        -dtb "$DTB" \
-        -initrd "$cpio" \
-        -append "$cmdline" \
-        "${extra[@]}" 2>&1 | tee "$OUT/boot.log"
+    "${run_cmd[@]}" 2>&1 | tee "$OUT/boot.log"
     local rc=${PIPESTATUS[0]}
     set -e
 
